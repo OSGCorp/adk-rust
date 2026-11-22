@@ -357,6 +357,68 @@ fn send_error<E: aws_sdk_bedrockruntime::error::ProvideErrorMetadata>(
     }
 }
 
+/// A failed `recv` on a ConverseStream response.
+///
+/// An exception event arrives inside an HTTP 200 response, so its category comes from what
+/// AWS documents for the exception and no upstream status is recorded.
+fn stream_error(
+    error: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
+        aws_smithy_types::event_stream::RawMessage,
+    >,
+    region: &str,
+    model_id: &str,
+    request_id: Option<&str>,
+) -> AdkError {
+    use adk_core::ErrorCategory;
+    use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let SdkError::ServiceError(service) = error else {
+        return AdkError::model(format!(
+            "Bedrock stream error for region={region}, model={model_id}: {error}"
+        ));
+    };
+    let exception = service.err();
+    let (name, category) = if exception.is_internal_server_exception() {
+        (Some("InternalServerException"), crate::retry::category_for_status_code(500))
+    } else if exception.is_model_stream_error_exception() {
+        // AWS documents `modelStreamErrorException` (424) as an error to retry.
+        (Some("ModelStreamErrorException"), ErrorCategory::Unavailable)
+    } else if exception.is_service_unavailable_exception() {
+        (Some("ServiceUnavailableException"), crate::retry::category_for_status_code(503))
+    } else if exception.is_throttling_exception() {
+        (Some("ThrottlingException"), crate::retry::category_for_status_code(429))
+    } else if exception.is_validation_exception() {
+        (Some("ValidationException"), crate::retry::category_for_status_code(400))
+    } else {
+        // The SDK parses an unmodelled exception's metadata from the payload alone, so its name
+        // is usually only in the frame's `:exception-type` header.
+        let header = match service.raw() {
+            RawMessage::Decoded(message) => message
+                .headers()
+                .iter()
+                .find(|header| header.name().as_str() == ":exception-type")
+                .and_then(|header| header.value().as_string().ok())
+                .map(|value| value.as_str()),
+            _ => None,
+        };
+        (exception.code().or(header), ErrorCategory::Internal)
+    };
+    let mut adk_error = exception_error(
+        "Bedrock stream error",
+        name,
+        exception.message(),
+        category,
+        region,
+        model_id,
+    );
+    if let Some(request_id) = request_id {
+        adk_error = adk_error.with_request_id(request_id);
+    }
+    adk_error
+}
+
 impl BedrockClient {
     /// Non-streaming: call `converse` and wrap the single response in a stream.
     async fn generate_non_streaming(
@@ -413,6 +475,9 @@ impl BedrockClient {
         let model_id = self.model_id.clone();
         let region = self.region.clone();
         let stream_idle = self.stream_idle;
+        // An exception event carries no request id; the response that opened the stream does.
+        let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&stream_output)
+            .map(str::to_owned);
 
         let response_stream = try_stream! {
             // Track tool use state for accumulating partial JSON arguments.
@@ -441,11 +506,9 @@ impl BedrockClient {
                     .with_provider("bedrock"))?;
                     break;
                 };
-                let Some(event) = next.map_err(|e| {
-                    AdkError::model(format!(
-                        "Bedrock stream error for region={region}, model={model_id}: {e}"
-                    ))
-                })? else {
+                let Some(event) =
+                    next.map_err(|e| stream_error(&e, &region, &model_id, request_id.as_deref()))?
+                else {
                     break;
                 };
                 match event {

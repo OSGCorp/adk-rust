@@ -1,5 +1,6 @@
 //! Bedrock service errors name the AWS exception, quote a bounded excerpt of its message,
-//! and take their category from the HTTP status.
+//! and take their category from the HTTP status, or mid-stream from what AWS documents for the
+//! exception.
 #![cfg(feature = "bedrock")]
 
 use adk_core::{AdkError, Content, ErrorCategory, Llm, LlmRequest, UPSTREAM_EXCERPT_BYTES};
@@ -65,6 +66,42 @@ async fn failure(model: &BedrockClient, stream: bool) -> AdkError {
 fn summary(error: &AdkError) -> (ErrorCategory, &str, &str, Value) {
     let details = serde_json::to_value(&*error.details).expect("details serialize");
     (error.category, error.code, error.message.as_str(), details)
+}
+
+/// The CRC-32 (IEEE) checksum the event-stream framing uses.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// One event-stream message with string headers.
+fn frame(headers: &[(&str, &str)], payload: &str) -> Vec<u8> {
+    let mut encoded_headers = Vec::new();
+    for (name, value) in headers {
+        encoded_headers.push(u8::try_from(name.len()).expect("short header name"));
+        encoded_headers.extend_from_slice(name.as_bytes());
+        encoded_headers.push(7);
+        encoded_headers
+            .extend_from_slice(&u16::try_from(value.len()).expect("short value").to_be_bytes());
+        encoded_headers.extend_from_slice(value.as_bytes());
+    }
+    let total = 12 + encoded_headers.len() + payload.len() + 4;
+    let mut message = Vec::with_capacity(total);
+    message.extend_from_slice(&u32::try_from(total).expect("small frame").to_be_bytes());
+    message.extend_from_slice(
+        &u32::try_from(encoded_headers.len()).expect("small headers").to_be_bytes(),
+    );
+    message.extend_from_slice(&crc32(&message).to_be_bytes());
+    message.extend_from_slice(&encoded_headers);
+    message.extend_from_slice(payload.as_bytes());
+    message.extend_from_slice(&crc32(&message).to_be_bytes());
+    message
 }
 
 #[tokio::test]
@@ -269,4 +306,113 @@ async fn a_validation_exception_is_sent_once_by_the_default_sdk_client() {
     let error = failure(&model, false).await;
     assert_eq!(error.category, ErrorCategory::InvalidInput, "{error}");
     // Dropping the server verifies the stub saw exactly one request.
+}
+
+#[test]
+fn crc32_matches_the_ieee_check_value() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+}
+
+#[tokio::test]
+async fn mid_stream_exceptions_take_the_documented_category_without_an_upstream_status() {
+    let cases = [
+        ("throttlingException", "ThrottlingException", ErrorCategory::RateLimited),
+        ("serviceUnavailableException", "ServiceUnavailableException", ErrorCategory::Unavailable),
+        ("internalServerException", "InternalServerException", ErrorCategory::Unavailable),
+        ("validationException", "ValidationException", ErrorCategory::InvalidInput),
+        ("modelStreamErrorException", "ModelStreamErrorException", ErrorCategory::Unavailable),
+        ("modelTimeoutException", "modelTimeoutException", ErrorCategory::Internal),
+    ];
+    for (exception_type, name, category) in cases {
+        let mut body = frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "messageStart"),
+                (":content-type", "application/json"),
+            ],
+            r#"{"role":"assistant"}"#,
+        );
+        body.extend(frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", exception_type),
+                (":content-type", "application/json"),
+            ],
+            &format!(r#"{{"message":"{exception_type} from the stub"}}"#),
+        ));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/m/converse-stream$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .insert_header("x-amzn-requestid", "req-stream")
+                    .set_body_bytes(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = failure(&client(&server.uri()), true).await;
+        let message = format!(
+            "Bedrock stream error for region=us-east-1, model=m: {name}: {exception_type} from the stub"
+        );
+        assert_eq!(
+            summary(&error),
+            (
+                category,
+                "model.bedrock.api_error",
+                message.as_str(),
+                json!({
+                    "request_id": "req-stream",
+                    "provider": "bedrock",
+                    "metadata": {"provider_error_code": name},
+                }),
+            ),
+            "{exception_type}"
+        );
+        assert_eq!(
+            error.is_retryable(),
+            matches!(category, ErrorCategory::RateLimited | ErrorCategory::Unavailable),
+            "{exception_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_error_frame_mid_stream_keeps_the_sdk_description() {
+    let mut body = frame(
+        &[
+            (":message-type", "event"),
+            (":event-type", "messageStart"),
+            (":content-type", "application/json"),
+        ],
+        r#"{"role":"assistant"}"#,
+    );
+    body.extend(frame(
+        &[
+            (":message-type", "error"),
+            (":error-code", "InternalFailure"),
+            (":error-message", "stream failed"),
+        ],
+        "",
+    ));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/model/m/converse-stream$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .insert_header("x-amzn-requestid", "req-stream")
+                .set_body_bytes(body),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = failure(&client(&server.uri()), true).await;
+    let (category, code, message, details) = summary(&error);
+    assert_eq!((category, code, details), (ErrorCategory::Internal, "model.legacy", json!({})));
+    assert!(
+        message.starts_with("Bedrock stream error for region=us-east-1, model=m: "),
+        "{message}"
+    );
 }
