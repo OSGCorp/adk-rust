@@ -281,16 +281,65 @@ fn timeout_config(timeouts: crate::HttpTimeouts) -> aws_smithy_types::timeout::T
         .build()
 }
 
-/// A failed Converse call, as `Timeout` when the connect or read timeout expired.
-fn send_error<E, R>(
-    error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
+/// A Bedrock exception as `model.bedrock.api_error`, its name kept as the provider error code.
+fn exception_error(
+    prefix: &str,
+    exception: Option<&str>,
+    service_message: Option<&str>,
+    category: adk_core::ErrorCategory,
     region: &str,
     model_id: &str,
-) -> AdkError
-where
-    aws_sdk_bedrockruntime::error::SdkError<E, R>: std::fmt::Display,
-{
-    use aws_sdk_bedrockruntime::error::SdkError;
+) -> AdkError {
+    let name = exception.unwrap_or("unnamed exception");
+    let mut message = format!("{prefix} for region={region}, model={model_id}: {name}");
+    if let Some(text) =
+        service_message.map(adk_core::upstream_excerpt).filter(|text| !text.is_empty())
+    {
+        message = format!("{message}: {text}");
+    }
+    let error = AdkError::new(
+        adk_core::ErrorComponent::Model,
+        category,
+        "model.bedrock.api_error",
+        message,
+    )
+    .with_provider("bedrock");
+    crate::error_metadata::with_code(error, exception)
+}
+
+/// A failed Converse call: `Timeout` when the connect or read timeout expired, the AWS
+/// exception for a service error, and the SDK's description otherwise.
+fn send_error<E: aws_sdk_bedrockruntime::error::ProvideErrorMetadata>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<E>,
+    region: &str,
+    model_id: &str,
+) -> AdkError {
+    use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+    use aws_sdk_bedrockruntime::operation::RequestId;
+
+    if let SdkError::ServiceError(service) = error {
+        let status = service.raw().status().as_u16();
+        // Bedrock documents both as 429; the name decides if a proxy reports another status.
+        let category = match error.code() {
+            Some("ThrottlingException" | "ModelNotReadyException") => {
+                adk_core::ErrorCategory::RateLimited
+            }
+            _ => crate::retry::category_for_status_code(status),
+        };
+        let mut adk_error = exception_error(
+            &format!("Bedrock API error (HTTP {status})"),
+            error.code(),
+            error.message(),
+            category,
+            region,
+            model_id,
+        )
+        .with_upstream_status(status);
+        if let Some(request_id) = error.request_id() {
+            adk_error = adk_error.with_request_id(request_id);
+        }
+        return adk_error;
+    }
 
     let message = format!("Bedrock API error for region={region}, model={model_id}: {error}");
     let timed_out = matches!(error, SdkError::TimeoutError(_))
