@@ -281,16 +281,65 @@ fn timeout_config(timeouts: crate::HttpTimeouts) -> aws_smithy_types::timeout::T
         .build()
 }
 
-/// A failed Converse call, as `Timeout` when the connect or read timeout expired.
-fn send_error<E, R>(
-    error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
+/// A Bedrock exception as `model.bedrock.api_error`, its name kept as the provider error code.
+fn exception_error(
+    prefix: &str,
+    exception: Option<&str>,
+    service_message: Option<&str>,
+    category: adk_core::ErrorCategory,
     region: &str,
     model_id: &str,
-) -> AdkError
-where
-    aws_sdk_bedrockruntime::error::SdkError<E, R>: std::fmt::Display,
-{
-    use aws_sdk_bedrockruntime::error::SdkError;
+) -> AdkError {
+    let name = exception.unwrap_or("unnamed exception");
+    let mut message = format!("{prefix} for region={region}, model={model_id}: {name}");
+    if let Some(text) =
+        service_message.map(adk_core::upstream_excerpt).filter(|text| !text.is_empty())
+    {
+        message = format!("{message}: {text}");
+    }
+    let error = AdkError::new(
+        adk_core::ErrorComponent::Model,
+        category,
+        "model.bedrock.api_error",
+        message,
+    )
+    .with_provider("bedrock");
+    crate::error_metadata::with_code(error, exception)
+}
+
+/// A failed Converse call: `Timeout` when the connect or read timeout expired, the AWS
+/// exception for a service error, and the SDK's description otherwise.
+fn send_error<E: aws_sdk_bedrockruntime::error::ProvideErrorMetadata>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<E>,
+    region: &str,
+    model_id: &str,
+) -> AdkError {
+    use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+    use aws_sdk_bedrockruntime::operation::RequestId;
+
+    if let SdkError::ServiceError(service) = error {
+        let status = service.raw().status().as_u16();
+        // Bedrock documents both as 429; the name decides if a proxy reports another status.
+        let category = match error.code() {
+            Some("ThrottlingException" | "ModelNotReadyException") => {
+                adk_core::ErrorCategory::RateLimited
+            }
+            _ => crate::retry::category_for_status_code(status),
+        };
+        let mut adk_error = exception_error(
+            &format!("Bedrock API error (HTTP {status})"),
+            error.code(),
+            error.message(),
+            category,
+            region,
+            model_id,
+        )
+        .with_upstream_status(status);
+        if let Some(request_id) = error.request_id() {
+            adk_error = adk_error.with_request_id(request_id);
+        }
+        return adk_error;
+    }
 
     let message = format!("Bedrock API error for region={region}, model={model_id}: {error}");
     let timed_out = matches!(error, SdkError::TimeoutError(_))
@@ -306,6 +355,68 @@ where
     } else {
         AdkError::model(message)
     }
+}
+
+/// A failed `recv` on a ConverseStream response.
+///
+/// An exception event arrives inside an HTTP 200 response, so its category comes from what
+/// AWS documents for the exception and no upstream status is recorded.
+fn stream_error(
+    error: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
+        aws_smithy_types::event_stream::RawMessage,
+    >,
+    region: &str,
+    model_id: &str,
+    request_id: Option<&str>,
+) -> AdkError {
+    use adk_core::ErrorCategory;
+    use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let SdkError::ServiceError(service) = error else {
+        return AdkError::model(format!(
+            "Bedrock stream error for region={region}, model={model_id}: {error}"
+        ));
+    };
+    let exception = service.err();
+    let (name, category) = if exception.is_internal_server_exception() {
+        (Some("InternalServerException"), crate::retry::category_for_status_code(500))
+    } else if exception.is_model_stream_error_exception() {
+        // AWS documents `modelStreamErrorException` (424) as an error to retry.
+        (Some("ModelStreamErrorException"), ErrorCategory::Unavailable)
+    } else if exception.is_service_unavailable_exception() {
+        (Some("ServiceUnavailableException"), crate::retry::category_for_status_code(503))
+    } else if exception.is_throttling_exception() {
+        (Some("ThrottlingException"), crate::retry::category_for_status_code(429))
+    } else if exception.is_validation_exception() {
+        (Some("ValidationException"), crate::retry::category_for_status_code(400))
+    } else {
+        // The SDK parses an unmodelled exception's metadata from the payload alone, so its name
+        // is usually only in the frame's `:exception-type` header.
+        let header = match service.raw() {
+            RawMessage::Decoded(message) => message
+                .headers()
+                .iter()
+                .find(|header| header.name().as_str() == ":exception-type")
+                .and_then(|header| header.value().as_string().ok())
+                .map(|value| value.as_str()),
+            _ => None,
+        };
+        (exception.code().or(header), ErrorCategory::Internal)
+    };
+    let mut adk_error = exception_error(
+        "Bedrock stream error",
+        name,
+        exception.message(),
+        category,
+        region,
+        model_id,
+    );
+    if let Some(request_id) = request_id {
+        adk_error = adk_error.with_request_id(request_id);
+    }
+    adk_error
 }
 
 impl BedrockClient {
@@ -364,6 +475,9 @@ impl BedrockClient {
         let model_id = self.model_id.clone();
         let region = self.region.clone();
         let stream_idle = self.stream_idle;
+        // An exception event carries no request id; the response that opened the stream does.
+        let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&stream_output)
+            .map(str::to_owned);
 
         let response_stream = try_stream! {
             // Track tool use state for accumulating partial JSON arguments.
@@ -392,11 +506,9 @@ impl BedrockClient {
                     .with_provider("bedrock"))?;
                     break;
                 };
-                let Some(event) = next.map_err(|e| {
-                    AdkError::model(format!(
-                        "Bedrock stream error for region={region}, model={model_id}: {e}"
-                    ))
-                })? else {
+                let Some(event) =
+                    next.map_err(|e| stream_error(&e, &region, &model_id, request_id.as_deref()))?
+                else {
                     break;
                 };
                 match event {
